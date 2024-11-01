@@ -1,0 +1,7 @@
+{
+    "name": "wp-yeager/wp-yeager",
+    "require": {
+        "jonahgeorge/jaeger-client-php": "^1.5",
+        "opentracing/opentracing": "^1.0"
+    }
+}
