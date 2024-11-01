@@ -1,6 +1,6 @@
 <?php
 /**
- * Plugin Name: WP Yeager
+ * Plugin Name: WP Jaeger
  * Description: A standalone WordPress plugin integrating Jaeger tracing.
  * Version: 0.0.1
  * Author: Gary Meng

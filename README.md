@@ -15,6 +15,6 @@ docker run -d --name jaeger
 
 # Install dependencies
 ```bash
-docker-compose run --rm composer require -n --ignore-platform-reqs jonahgeorge/jaeger-client-php
-docker-compose run --rm composer require -n --ignore-platform-reqs opentracing/opentracing
+docker compose run --rm composer require  jonahgeorge/jaeger-client-php -n --ignore-platform-reqs
+docker compose run --rm composer require -n --ignore-platform-reqs opentracing/opentracing
 ```
