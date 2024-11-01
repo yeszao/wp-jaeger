@@ -125,7 +125,7 @@ class WordPressJaeger {
             $duration = microtime(true) - $startTime;
 
             // Only create a span if the query takes longer than a threshold
-            if ($duration > 500000) { // Adjust as needed
+            if ($duration > 1000000) { // Adjust as needed
                 $span = $this->tracer->startSpan('database_query', ['child_of' => $this->requestSpan]);
                 $span->setTag('db.statement', $query);
                 $span->setTag('db.type', 'mysql');
