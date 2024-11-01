@@ -15,12 +15,13 @@ const YAEGER_REPORTING_PORT = 6831;
 
 use Jaeger\Config;
 use OpenTracing\GlobalTracer;
-use OpenTracing\Formats;
+use const OpenTracing\Formats\HTTP_HEADERS;
 use const Jaeger\SAMPLER_TYPE_CONST;
 
 class WordPressJaeger {
     private static $instance = null;
     private $tracer;
+    private $requestSpan = null;
 
     public static function getInstance() {
         if (self::$instance === null) {
@@ -39,7 +40,7 @@ class WordPressJaeger {
             [
                 'sampler' => [
                     'type' => SAMPLER_TYPE_CONST,
-                    'param' => 1,
+                    'param' => true,
                 ],
                 'local_agent' => [
                     'reporting_host' => YAEGER_REPORTING_HOST,
@@ -49,8 +50,9 @@ class WordPressJaeger {
             ],
             YAEGER_SERVICE_NAME
         );
+        $config->initializeTracer();
 
-        $this->tracer = $config->initTracer();
+        $this->tracer = GlobalTracer::get();
         GlobalTracer::set($this->tracer);
     }
 
@@ -59,8 +61,8 @@ class WordPressJaeger {
         add_action('init', [$this, 'startRequestSpan']);
         add_action('shutdown', [$this, 'endRequestSpan']);
 
-        // Track database queries
-        add_filter('query', [$this, 'trackDatabaseQuery']);
+        // Track database queries with lower priority to ensure request span is created
+        add_filter('query', [$this, 'trackDatabaseQuery'], 999);
 
         // Track template loading
         add_action('template_include', [$this, 'trackTemplateLoad']);
@@ -69,81 +71,135 @@ class WordPressJaeger {
         add_action('rest_api_init', [$this, 'trackRestApiRequest']);
     }
 
-    private $requestSpan = null;
-
     public function startRequestSpan() {
-        $spanContext = $this->tracer->extract(
-            Formats::HTTP_HEADERS,
-            getallheaders()
-        );
+        try {
+            // Try to extract context from headers, but don't fail if it's not possible
+            $spanContext = null;
+            try {
+                $spanContext = $this->tracer->extract(
+                    HTTP_HEADERS,
+                    getallheaders() ?: []
+                );
+            } catch (Exception $e) {
+                // Ignore extraction errors
+            }
 
-        $this->requestSpan = $this->tracer->startSpan(
-            'wordpress_request',
-            [
-                'child_of' => $spanContext,
-                'tags' => [
-                    'http.url' => $_SERVER['REQUEST_URI'],
-                    'http.method' => $_SERVER['REQUEST_METHOD'],
-                    'wordpress.user' => is_user_logged_in() ? wp_get_current_user()->user_login : 'anonymous'
-                ]
-            ]
-        );
+            // Always create a root span
+            $this->requestSpan = $this->tracer->startSpan(
+                'wordpress_request',
+                $spanContext ? ['child_of' => $spanContext] : []
+            );
+
+            // Add tags to the request span
+            if ($this->requestSpan) {
+                $this->requestSpan->setTag('http.url', $_SERVER['REQUEST_URI'] ?? 'unknown');
+                $this->requestSpan->setTag('http.method', $_SERVER['REQUEST_METHOD'] ?? 'unknown');
+                $this->requestSpan->setTag(
+                    'wordpress.user',
+                    is_user_logged_in() ? wp_get_current_user()->user_login : 'anonymous'
+                );
+            }
+        } catch (Exception $e) {
+            error_log('Error starting request span: ' . $e->getMessage());
+        }
     }
 
     public function endRequestSpan() {
-        if ($this->requestSpan) {
-            $this->requestSpan->finish();
+        try {
+            if ($this->requestSpan) {
+                $this->requestSpan->finish();
+            }
+            $this->tracer->flush();
+        } catch (Exception $e) {
+            error_log('Error ending request span: ' . $e->getMessage());
         }
-        $this->tracer->flush();
     }
 
     public function trackDatabaseQuery($query) {
-        $span = $this->tracer->startSpan(
-            'database_query',
-            ['child_of' => $this->requestSpan]
-        );
+        try {
+            if (!$this->requestSpan) return $query;
 
-        $span->setTag('db.statement', $query);
-        $span->setTag('db.type', 'mysql');
+            global $wpdb;
+            $startTime = microtime(true);
+            $result = $wpdb->query($query);
+            $duration = microtime(true) - $startTime;
 
-        // Execute query
-        global $wpdb;
-        $result = $wpdb->query($query);
-
-        $span->setTag('db.rows_affected', $wpdb->rows_affected);
-        $span->finish();
-
+            // Only create a span if the query takes longer than a threshold
+            if ($duration > 1) { // Adjust as needed
+                $span = $this->tracer->startSpan('database_query', ['child_of' => $this->requestSpan]);
+                $span->setTag('db.statement', $query);
+                $span->setTag('db.type', 'mysql');
+                $span->setTag('db.duration', $duration);
+                register_shutdown_function(function() use ($span) {
+                    try {
+                        $span->finish();
+                        $this->tracer->flush();
+                    } catch (Exception $e) {
+                        error_log('Error finishing dbQuery request span: ' . $e->getMessage());
+                    }
+                });
+            }
+        } catch (Exception $e) {
+            error_log('Error tracking database query: ' . $e->getMessage());
+        }
         return $query;
     }
 
+
     public function trackTemplateLoad($template) {
-        $span = $this->tracer->startSpan(
-            'template_load',
-            ['child_of' => $this->requestSpan]
-        );
+        try {
+            // Only create a span if we have a valid request span
+            if (!$this->requestSpan) {
+                return $template;
+            }
 
-        $span->setTag('template.path', $template);
-        $span->setTag('template.name', basename($template));
+            $span = $this->tracer->startSpan(
+                'template_load',
+                ['child_of' => $this->requestSpan]
+            );
 
-        register_shutdown_function(function() use ($span) {
-            $span->finish();
-        });
+            $span->setTag('template.path', $template);
+            $span->setTag('template.name', basename($template));
+
+            register_shutdown_function(function() use ($span) {
+                try {
+                    $span->finish();
+                } catch (Exception $e) {
+                    error_log('Error finishing template load span: ' . $e->getMessage());
+                }
+            });
+        } catch (Exception $e) {
+            error_log('Error tracking template load: ' . $e->getMessage());
+        }
 
         return $template;
     }
 
     public function trackRestApiRequest() {
-        $span = $this->tracer->startSpan(
-            'rest_api_request',
-            ['child_of' => $this->requestSpan]
-        );
+        try {
+            // Only create a span if we have a valid request span
+            if (!$this->requestSpan) {
+                return;
+            }
 
-        $span->setTag('api.endpoint', rest_get_url_prefix() . $_SERVER['REQUEST_URI']);
-        $span->setTag('api.method', $_SERVER['REQUEST_METHOD']);
+            $span = $this->tracer->startSpan(
+                'rest_api_request',
+                ['child_of' => $this->requestSpan]
+            );
 
-        register_shutdown_function(function() use ($span) {
-            $span->finish();
-        });
+            $span->setTag('api.endpoint', rest_get_url_prefix() . ($_SERVER['REQUEST_URI'] ?? 'unknown'));
+            $span->setTag('api.method', $_SERVER['REQUEST_METHOD'] ?? 'unknown');
+
+            register_shutdown_function(function() use ($span) {
+                try {
+                    $span->finish();
+                } catch (Exception $e) {
+                    error_log('Error finishing REST API request span: ' . $e->getMessage());
+                }
+            });
+        } catch (Exception $e) {
+            error_log('Error tracking REST API request: ' . $e->getMessage());
+        }
     }
 }
 
